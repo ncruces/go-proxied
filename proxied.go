@@ -79,7 +79,7 @@ func (tr *transport) RoundTrip(req *http.Request) (*http.Response, error) {
 
 		if auth, err := tr.authorize(req, res.Header.Get("Proxy-Authenticate")); err != nil {
 			return nil, err
-		} else if auth != "" {
+		} else if auth != "" && auth != req.Header.Get("Proxy-Authorization") {
 			req.Header.Set("Proxy-Authorization", auth)
 			res, err = tr.transport.RoundTrip(req)
 			if res != nil && res.StatusCode == http.StatusProxyAuthRequired {
@@ -128,7 +128,7 @@ func (tr *transport) wrapDialContext() {
 
 			if auth, err := tr.authorize(req, res.Header.Get("Proxy-Authenticate")); err != nil {
 				return nil, err
-			} else if auth != "" {
+			} else if auth != "" && auth != req.Header.Get("Proxy-Authorization") {
 				req.Header.Set("Proxy-Authorization", auth)
 				res, err = makeReq(ctx, conn, req)
 			}
