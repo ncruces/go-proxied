@@ -130,47 +130,6 @@ func (tr *transport) wrapDialContext() {
 	}
 }
 
-// adapted from: https://pkg.go.dev/net/http#Transport
-func makeReq(ctx context.Context, conn net.Conn, connectReq *http.Request) (resp *http.Response, err error) {
-	// If there's no done channel (no deadline or cancellation
-	// from the caller possible), at least set some (long)
-	// timeout here. This will make sure we don't block forever
-	// and leak a goroutine if the connection stops replying
-	// after the TCP connect.
-	connectCtx := ctx
-	if ctx.Done() == nil {
-		newCtx, cancel := context.WithTimeout(ctx, 1*time.Minute)
-		defer cancel()
-		connectCtx = newCtx
-	}
-
-	didReadResponse := make(chan struct{}) // closed after CONNECT write+read is done or fails
-	// Write the CONNECT request & read the response.
-	go func() {
-		defer close(didReadResponse)
-		err = connectReq.Write(conn)
-		if err != nil {
-			return
-		}
-		// Okay to use and discard buffered reader here, because
-		// TLS server will not speak until spoken to.
-		br := bufio.NewReader(conn)
-		resp, err = http.ReadResponse(br, connectReq)
-	}()
-	select {
-	case <-connectCtx.Done():
-		conn.Close()
-		<-didReadResponse
-		return nil, connectCtx.Err()
-	case <-didReadResponse:
-		// resp or err now set
-	}
-	if err != nil {
-		conn.Close()
-	}
-	return
-}
-
 func (tr *transport) authorize(req *http.Request, authenticate string) string {
 	// if tr.proxy == nil || tr.proxy.User == nil {
 	// 	return ""
@@ -237,6 +196,47 @@ func (tr *transport) authorize(req *http.Request, authenticate string) string {
 	}
 
 	return ""
+}
+
+// adapted from: https://pkg.go.dev/net/http#Transport
+func makeReq(ctx context.Context, conn net.Conn, connectReq *http.Request) (resp *http.Response, err error) {
+	// If there's no done channel (no deadline or cancellation
+	// from the caller possible), at least set some (long)
+	// timeout here. This will make sure we don't block forever
+	// and leak a goroutine if the connection stops replying
+	// after the TCP connect.
+	connectCtx := ctx
+	if ctx.Done() == nil {
+		newCtx, cancel := context.WithTimeout(ctx, 1*time.Minute)
+		defer cancel()
+		connectCtx = newCtx
+	}
+
+	didReadResponse := make(chan struct{}) // closed after CONNECT write+read is done or fails
+	// Write the CONNECT request & read the response.
+	go func() {
+		defer close(didReadResponse)
+		err = connectReq.Write(conn)
+		if err != nil {
+			return
+		}
+		// Okay to use and discard buffered reader here, because
+		// TLS server will not speak until spoken to.
+		br := bufio.NewReader(conn)
+		resp, err = http.ReadResponse(br, connectReq)
+	}()
+	select {
+	case <-connectCtx.Done():
+		conn.Close()
+		<-didReadResponse
+		return nil, connectCtx.Err()
+	case <-didReadResponse:
+		// resp or err now set
+	}
+	if err != nil {
+		conn.Close()
+	}
+	return
 }
 
 // adapted from: https://pkg.go.dev/github.com/golang/gddo/httputil/header#ParseList
