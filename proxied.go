@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/dchest/uniuri"
@@ -24,23 +25,36 @@ func NewProxiedTransport(proxy *url.URL) http.RoundTripper {
 		return clone
 	}
 
+	var tr transport
+
 	noAuth := *proxy
 	noAuth.User = nil
 
-	plain := http.DefaultTransport.(*http.Transport).Clone()
-	plain.Proxy = http.ProxyURL(&noAuth)
+	tr.proxy = proxy
 
-	https := http.DefaultTransport.(*http.Transport).Clone()
-	https.DialContext = tlsDialContext(https.DialContext, proxy)
-	https.Proxy = nil
+	tr.transport = http.DefaultTransport.(*http.Transport).Clone()
+	tr.transport.Proxy = http.ProxyURL(&noAuth)
 
-	return &transport{proxy, plain, https}
+	tr.tlsTransport = http.DefaultTransport.(*http.Transport).Clone()
+	tr.tlsTransport.Proxy = nil
+	tr.wrapDialContext()
+
+	return &tr
 }
 
 type transport struct {
 	proxy        *url.URL
 	transport    *http.Transport
 	tlsTransport *http.Transport
+
+	auth struct {
+		mx    sync.Mutex
+		typ   string
+		realm string
+		qop   string
+		nonce string
+		nc    int
+	}
 }
 
 func (tr *transport) RoundTrip(req *http.Request) (*http.Response, error) {
@@ -48,12 +62,8 @@ func (tr *transport) RoundTrip(req *http.Request) (*http.Response, error) {
 		return tr.tlsTransport.RoundTrip(req)
 	}
 
-	// Basic authentication, over TLS only
-	if tr.proxy.Scheme == "https" {
-		auth := authorize(tr.proxy, req, "Basic")
-		if auth != "" {
-			req.Header.Set("Proxy-Authorization", auth)
-		}
+	if auth := tr.authorize(req, ""); auth != "" {
+		req.Header.Set("Proxy-Authorization", auth)
 	}
 
 	res, err := tr.transport.RoundTrip(req)
@@ -63,8 +73,7 @@ func (tr *transport) RoundTrip(req *http.Request) (*http.Response, error) {
 			return nil, err
 		}
 
-		auth := authorize(tr.proxy, req, res.Header.Get("Proxy-Authenticate"))
-		if auth != "" {
+		if auth := tr.authorize(req, res.Header.Get("Proxy-Authenticate")); auth != "" {
 			req.Header.Set("Proxy-Authorization", auth)
 			res, err = tr.transport.RoundTrip(req)
 			if res != nil && res.StatusCode == http.StatusProxyAuthRequired {
@@ -75,11 +84,13 @@ func (tr *transport) RoundTrip(req *http.Request) (*http.Response, error) {
 	return res, err
 }
 
-type dialContext func(ctx context.Context, network, addr string) (net.Conn, error)
+func (tr *transport) wrapDialContext() {
+	// store the default DialContext
+	dialContext := tr.tlsTransport.DialContext
 
-func tlsDialContext(dialContext dialContext, proxy *url.URL) dialContext {
-	return func(ctx context.Context, network, addr string) (conn net.Conn, err error) {
-		conn, err = dialContext(ctx, network, proxy.Host)
+	// and wrap it
+	tr.tlsTransport.DialContext = func(ctx context.Context, network, addr string) (conn net.Conn, err error) {
+		conn, err = dialContext(ctx, network, tr.proxy.Host)
 		if err != nil {
 			return nil, err
 		}
@@ -96,12 +107,8 @@ func tlsDialContext(dialContext dialContext, proxy *url.URL) dialContext {
 			Header: make(http.Header),
 		}
 
-		// Basic authentication, over TLS only
-		if proxy.Scheme == "https" {
-			auth := authorize(proxy, req, "Basic")
-			if auth != "" {
-				req.Header.Set("Proxy-Authorization", auth)
-			}
+		if auth := tr.authorize(req, ""); auth != "" {
+			req.Header.Set("Proxy-Authorization", auth)
 		}
 
 		res, err := makeReq(ctx, conn, req)
@@ -111,8 +118,7 @@ func tlsDialContext(dialContext dialContext, proxy *url.URL) dialContext {
 				return
 			}
 
-			auth := authorize(proxy, req, res.Header.Get("Proxy-Authenticate"))
-			if auth != "" {
+			if auth := tr.authorize(req, res.Header.Get("Proxy-Authenticate")); auth != "" {
 				req.Header.Set("Proxy-Authorization", auth)
 				res, err = makeReq(ctx, conn, req)
 			}
@@ -165,54 +171,69 @@ func makeReq(ctx context.Context, conn net.Conn, connectReq *http.Request) (resp
 	return
 }
 
-func authorize(proxy *url.URL, req *http.Request, authenticate string) string {
-	if proxy == nil || proxy.User == nil {
-		return ""
+func (tr *transport) authorize(req *http.Request, authenticate string) string {
+	// if tr.proxy == nil || tr.proxy.User == nil {
+	// 	return ""
+	// }
+
+	username := tr.proxy.User.Username()
+	password, _ := tr.proxy.User.Password()
+
+	tr.auth.mx.Lock()
+	defer tr.auth.mx.Unlock()
+
+	// parse authenticate header
+	if authenticate != "" {
+		s := strings.SplitN(authenticate, " ", 2)
+
+		switch s[0] {
+		case "Basic":
+			tr.auth.typ = "Basic"
+
+		case "Digest":
+			tr.auth.typ = "Digest"
+
+			for _, i := range parseList(s[1]) {
+				s := strings.SplitN(i, "=", 2)
+				if len(s) < 2 {
+					continue
+				}
+
+				s[1] = strings.TrimPrefix(s[1], `"`)
+				s[1] = strings.TrimSuffix(s[1], `"`)
+
+				switch s[0] {
+				case "realm":
+					tr.auth.realm = s[1]
+				case "qop":
+					tr.auth.qop = s[1]
+				case "nonce":
+					tr.auth.nonce = s[1]
+				}
+			}
+		}
 	}
 
-	username := proxy.User.Username()
-	password, _ := proxy.User.Password()
-
-	s := strings.SplitN(authenticate, " ", 2)
-	if len(s) == 0 {
-		return ""
+	// we don't have a saved authentication type, but are secure, so try Basic
+	if tr.auth.typ == "" && tr.proxy.Scheme == "https" {
+		tr.auth.typ = "Basic"
 	}
 
-	switch s[0] {
+	switch tr.auth.typ {
 	case "Basic":
 		auth := username + ":" + password
 		return "Basic " + base64.StdEncoding.EncodeToString([]byte(auth))
 
 	case "Digest":
-		var realm, nonce, qop string
-
-		for _, i := range parseList(s[1]) {
-			s := strings.SplitN(i, "=", 2)
-			if len(s) < 2 {
-				continue
-			}
-
-			s[1] = strings.TrimPrefix(s[1], `"`)
-			s[1] = strings.TrimSuffix(s[1], `"`)
-
-			switch s[0] {
-			case "realm":
-				realm = s[1]
-			case "nonce":
-				nonce = s[1]
-			case "qop":
-				qop = s[1]
-			}
-		}
-
-		ha1 := getMD5(username, realm, password)
-		ha2 := getMD5(req.Method, req.URL.String())
-		nc := "00000001"
+		tr.auth.nc += 1
 		cnonce := uniuri.New()
-		response := getMD5(ha1, nonce, nc, cnonce, qop, ha2)
+		nc := fmt.Sprintf("%08x", tr.auth.nc)
+		ha1 := getMD5(username, tr.auth.realm, password)
+		ha2 := getMD5(req.Method, req.URL.String())
+		response := getMD5(ha1, tr.auth.nonce, nc, cnonce, tr.auth.qop, ha2)
 		return fmt.Sprintf(
 			`Digest username="%s", realm="%s", nonce="%s", uri="%s", qop=%s, nc=%s, cnonce="%s", response="%s"`,
-			username, realm, nonce, req.URL, qop, nc, cnonce, response)
+			username, tr.auth.realm, tr.auth.nonce, req.URL, tr.auth.qop, nc, cnonce, response)
 	}
 
 	return ""

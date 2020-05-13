@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"strings"
 	"testing"
 )
 
@@ -30,7 +31,7 @@ func TestMain(m *testing.M) {
 	os.Exit(m.Run())
 }
 
-func TestNewProxiedTransport(t *testing.T) {
+func TestNewProxiedTransportPlain(t *testing.T) {
 	res, err := client.Get("http://1.1.1.1/cdn-cgi/trace")
 	if err != nil {
 		t.Fatal(err)
@@ -41,13 +42,15 @@ func TestNewProxiedTransport(t *testing.T) {
 		t.Fatal(http.StatusText(res.StatusCode))
 	}
 
-	_, err = io.Copy(os.Stdout, res.Body)
-	if err != nil {
+	var buf strings.Builder
+	if _, err = io.Copy(&buf, res.Body); err != nil {
 		t.Fatal(err)
+	} else {
+		t.Log(buf.String())
 	}
 }
 
-func TestNewProxiedTransportTLS(t *testing.T) {
+func TestNewProxiedTransportHTTPS(t *testing.T) {
 	res, err := client.Get("https://1.1.1.1/cdn-cgi/trace")
 	if err != nil {
 		t.Fatal(err)
@@ -58,8 +61,10 @@ func TestNewProxiedTransportTLS(t *testing.T) {
 		t.Fatal(http.StatusText(res.StatusCode))
 	}
 
-	_, err = io.Copy(os.Stdout, res.Body)
-	if err != nil {
+	var buf strings.Builder
+	if _, err = io.Copy(&buf, res.Body); err != nil {
 		t.Fatal(err)
+	} else {
+		t.Log(buf.String())
 	}
 }
