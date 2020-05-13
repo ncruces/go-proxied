@@ -48,12 +48,14 @@ type transport struct {
 	tlsTransport *http.Transport
 
 	auth struct {
-		mx    sync.Mutex
-		typ   string
-		realm string
-		qop   string
-		nonce string
-		nc    int
+		mx        sync.Mutex
+		typ       string
+		realm     string
+		nonce     string
+		opaque    string
+		algorithm string
+		qop       string
+		nc        int
 	}
 }
 
@@ -62,7 +64,9 @@ func (tr *transport) RoundTrip(req *http.Request) (*http.Response, error) {
 		return tr.tlsTransport.RoundTrip(req)
 	}
 
-	if auth := tr.authorize(req, ""); auth != "" {
+	if auth, err := tr.authorize(req, ""); err != nil {
+		return nil, err
+	} else if auth != "" {
 		req.Header.Set("Proxy-Authorization", auth)
 	}
 
@@ -73,7 +77,9 @@ func (tr *transport) RoundTrip(req *http.Request) (*http.Response, error) {
 			return nil, err
 		}
 
-		if auth := tr.authorize(req, res.Header.Get("Proxy-Authenticate")); auth != "" {
+		if auth, err := tr.authorize(req, res.Header.Get("Proxy-Authenticate")); err != nil {
+			return nil, err
+		} else if auth != "" {
 			req.Header.Set("Proxy-Authorization", auth)
 			res, err = tr.transport.RoundTrip(req)
 			if res != nil && res.StatusCode == http.StatusProxyAuthRequired {
@@ -107,7 +113,9 @@ func (tr *transport) wrapDialContext() {
 			Header: make(http.Header),
 		}
 
-		if auth := tr.authorize(req, ""); auth != "" {
+		if auth, err := tr.authorize(req, ""); err != nil {
+			return nil, err
+		} else if auth != "" {
 			req.Header.Set("Proxy-Authorization", auth)
 		}
 
@@ -118,7 +126,9 @@ func (tr *transport) wrapDialContext() {
 				return
 			}
 
-			if auth := tr.authorize(req, res.Header.Get("Proxy-Authenticate")); auth != "" {
+			if auth, err := tr.authorize(req, res.Header.Get("Proxy-Authenticate")); err != nil {
+				return nil, err
+			} else if auth != "" {
 				req.Header.Set("Proxy-Authorization", auth)
 				res, err = makeReq(ctx, conn, req)
 			}
@@ -130,7 +140,7 @@ func (tr *transport) wrapDialContext() {
 	}
 }
 
-func (tr *transport) authorize(req *http.Request, authenticate string) string {
+func (tr *transport) authorize(req *http.Request, authenticate string) (string, error) {
 	// if tr.proxy == nil || tr.proxy.User == nil {
 	// 	return ""
 	// }
@@ -144,14 +154,9 @@ func (tr *transport) authorize(req *http.Request, authenticate string) string {
 	// parse authenticate header
 	if authenticate != "" {
 		s := strings.SplitN(authenticate, " ", 2)
+		tr.auth.typ = s[0]
 
-		switch s[0] {
-		case "Basic":
-			tr.auth.typ = "Basic"
-
-		case "Digest":
-			tr.auth.typ = "Digest"
-
+		if tr.auth.typ == "Digest" {
 			for _, i := range parseList(s[1]) {
 				s := strings.SplitN(i, "=", 2)
 				if len(s) < 2 {
@@ -164,10 +169,14 @@ func (tr *transport) authorize(req *http.Request, authenticate string) string {
 				switch s[0] {
 				case "realm":
 					tr.auth.realm = s[1]
-				case "qop":
-					tr.auth.qop = s[1]
 				case "nonce":
 					tr.auth.nonce = s[1]
+				case "opaque":
+					tr.auth.opaque = s[1]
+				case "algorithm":
+					tr.auth.algorithm = s[1]
+				case "qop":
+					tr.auth.qop = s[1]
 				}
 			}
 		}
@@ -178,24 +187,50 @@ func (tr *transport) authorize(req *http.Request, authenticate string) string {
 		tr.auth.typ = "Basic"
 	}
 
+	var response string
+
 	switch tr.auth.typ {
 	case "Basic":
 		auth := username + ":" + password
-		return "Basic " + base64.StdEncoding.EncodeToString([]byte(auth))
+		response = "Basic " + base64.StdEncoding.EncodeToString([]byte(auth))
 
 	case "Digest":
-		tr.auth.nc += 1
-		cnonce := uniuri.New()
-		nc := fmt.Sprintf("%08x", tr.auth.nc)
-		ha1 := getMD5(username, tr.auth.realm, password)
-		ha2 := getMD5(req.Method, req.URL.String())
-		response := getMD5(ha1, tr.auth.nonce, nc, cnonce, tr.auth.qop, ha2)
-		return fmt.Sprintf(
-			`Digest username="%s", realm="%s", nonce="%s", uri="%s", qop=%s, nc=%s, cnonce="%s", response="%s"`,
-			username, tr.auth.realm, tr.auth.nonce, req.URL, tr.auth.qop, nc, cnonce, response)
+		if tr.auth.algorithm != "" && tr.auth.algorithm != "MD5" {
+			return "", errors.New("Digest authentication: unsupported algorithm")
+		}
+		if tr.auth.qop != "" && tr.auth.qop != "auth" {
+			return "", errors.New("Digest authentication: unsupported quality of protection")
+		}
+
+		ha1 := getMD5(username, tr.auth.realm, password) // OK
+		ha2 := getMD5(req.Method, req.URL.String())      // OK
+
+		if tr.auth.qop == "" {
+			response = fmt.Sprintf(
+				`Digest username="%s", realm="%s", nonce="%s", uri="%s", response="%s"`,
+				username, tr.auth.realm, tr.auth.nonce, req.URL, // escape these
+				getMD5(ha1, tr.auth.nonce, ha2))
+		} else {
+			tr.auth.nc += 1
+			cnonce := uniuri.New()
+			nc := fmt.Sprintf("%08x", tr.auth.nc)
+
+			response = fmt.Sprintf(
+				`Digest username="%s", realm="%s", nonce="%s", uri="%s", response="%s", nc=%s, cnonce="%s", qop=%s`,
+				username, tr.auth.realm, tr.auth.nonce, req.URL, // escape these
+				getMD5(ha1, tr.auth.nonce, nc, cnonce, tr.auth.qop, ha2),
+				nc, cnonce, tr.auth.qop)
+		}
+
+		if tr.auth.algorithm != "" {
+			response = response + `, algorithm=` + tr.auth.algorithm
+		}
+		if tr.auth.opaque != "" {
+			response = response + `, opaque="` + tr.auth.opaque + `"` // escape
+		}
 	}
 
-	return ""
+	return response, nil
 }
 
 // adapted from: https://pkg.go.dev/net/http#Transport
