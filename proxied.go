@@ -63,14 +63,44 @@ func (tr *transport) RoundTrip(req *http.Request) (*http.Response, error) {
 	if req.URL.Scheme == "https" {
 		return tr.tlsTransport.RoundTrip(req)
 	}
+	return tr.doRoundTrip(req, tr.transport)
+}
 
+func (tr *transport) wrapDialContext() {
+	// store the default DialContext
+	dialContext := tr.tlsTransport.DialContext
+
+	// and wrap it
+	tr.tlsTransport.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+		conn, err := dialContext(ctx, network, tr.proxy.Host)
+		if err != nil {
+			return nil, err
+		}
+
+		req := &http.Request{
+			Method: http.MethodConnect,
+			URL:    &url.URL{Opaque: addr},
+			Host:   addr,
+			Header: make(http.Header),
+		}
+
+		_, err = tr.doRoundTrip(req, &connectRoundTripper{ctx, conn})
+		if err != nil {
+			conn.Close()
+			return nil, err
+		}
+		return conn, nil
+	}
+}
+
+func (tr *transport) doRoundTrip(req *http.Request, rt http.RoundTripper) (*http.Response, error) {
 	if auth, err := tr.authorize(req, ""); err != nil {
 		return nil, err
 	} else if auth != "" {
 		req.Header.Set("Proxy-Authorization", auth)
 	}
 
-	res, err := tr.transport.RoundTrip(req)
+	res, err := rt.RoundTrip(req)
 	if res != nil && res.StatusCode == http.StatusProxyAuthRequired {
 		err = res.Body.Close()
 		if err != nil {
@@ -81,63 +111,10 @@ func (tr *transport) RoundTrip(req *http.Request) (*http.Response, error) {
 			return nil, err
 		} else if auth != "" && auth != req.Header.Get("Proxy-Authorization") {
 			req.Header.Set("Proxy-Authorization", auth)
-			res, err = tr.transport.RoundTrip(req)
-			if res != nil && res.StatusCode == http.StatusProxyAuthRequired {
-				return nil, getStatusError(res.Status)
-			}
+			res, err = rt.RoundTrip(req)
 		}
 	}
 	return res, err
-}
-
-func (tr *transport) wrapDialContext() {
-	// store the default DialContext
-	dialContext := tr.tlsTransport.DialContext
-
-	// and wrap it
-	tr.tlsTransport.DialContext = func(ctx context.Context, network, addr string) (conn net.Conn, err error) {
-		conn, err = dialContext(ctx, network, tr.proxy.Host)
-		if err != nil {
-			return nil, err
-		}
-		defer func() {
-			if err != nil {
-				conn.Close()
-			}
-		}()
-
-		req := &http.Request{
-			Method: http.MethodConnect,
-			URL:    &url.URL{Opaque: addr},
-			Host:   addr,
-			Header: make(http.Header),
-		}
-
-		if auth, err := tr.authorize(req, ""); err != nil {
-			return nil, err
-		} else if auth != "" {
-			req.Header.Set("Proxy-Authorization", auth)
-		}
-
-		res, err := makeReq(ctx, conn, req)
-		if res != nil && res.StatusCode == http.StatusProxyAuthRequired {
-			err = res.Body.Close()
-			if err != nil {
-				return
-			}
-
-			if auth, err := tr.authorize(req, res.Header.Get("Proxy-Authenticate")); err != nil {
-				return nil, err
-			} else if auth != "" && auth != req.Header.Get("Proxy-Authorization") {
-				req.Header.Set("Proxy-Authorization", auth)
-				res, err = makeReq(ctx, conn, req)
-			}
-		}
-		if res != nil && res.StatusCode != http.StatusOK {
-			err = getStatusError(res.Status)
-		}
-		return
-	}
 }
 
 func (tr *transport) authorize(req *http.Request, authenticate string) (string, error) {
@@ -233,45 +210,55 @@ func (tr *transport) authorize(req *http.Request, authenticate string) (string, 
 	return response, nil
 }
 
+type connectRoundTripper struct {
+	ctx  context.Context
+	conn net.Conn
+}
+
 // adapted from: https://pkg.go.dev/net/http#Transport
-func makeReq(ctx context.Context, conn net.Conn, connectReq *http.Request) (resp *http.Response, err error) {
+func (rt *connectRoundTripper) RoundTrip(req *http.Request) (res *http.Response, err error) {
 	// If there's no done channel (no deadline or cancellation
 	// from the caller possible), at least set some (long)
 	// timeout here. This will make sure we don't block forever
 	// and leak a goroutine if the connection stops replying
 	// after the TCP connect.
-	connectCtx := ctx
+	ctx := rt.ctx
 	if ctx.Done() == nil {
 		newCtx, cancel := context.WithTimeout(ctx, 1*time.Minute)
 		defer cancel()
-		connectCtx = newCtx
+		ctx = newCtx
 	}
 
-	didReadResponse := make(chan struct{}) // closed after CONNECT write+read is done or fails
+	readDone := make(chan struct{}) // closed after CONNECT write+read is done or fails
 	// Write the CONNECT request & read the response.
 	go func() {
-		defer close(didReadResponse)
-		err = connectReq.Write(conn)
+		defer close(readDone)
+		err = req.Write(rt.conn)
 		if err != nil {
 			return
 		}
 		// Okay to use and discard buffered reader here, because
 		// TLS server will not speak until spoken to.
-		br := bufio.NewReader(conn)
-		resp, err = http.ReadResponse(br, connectReq)
+		br := bufio.NewReader(rt.conn)
+		res, err = http.ReadResponse(br, req)
 	}()
 	select {
-	case <-connectCtx.Done():
-		conn.Close()
-		<-didReadResponse
-		return nil, connectCtx.Err()
-	case <-didReadResponse:
-		// resp or err now set
+	case <-ctx.Done():
+		rt.conn.Close()
+		<-readDone
+		return nil, ctx.Err()
+	case <-readDone:
+		// res or err now set
 	}
 	if err != nil {
-		conn.Close()
+		rt.conn.Close()
+		return nil, err
 	}
-	return
+	if res.StatusCode != http.StatusOK {
+		rt.conn.Close()
+		return nil, getStatusError(res.Status)
+	}
+	return res, nil
 }
 
 // adapted from: https://pkg.go.dev/github.com/golang/gddo/httputil/header#ParseList
