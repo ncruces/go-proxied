@@ -15,7 +15,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/dchest/uniuri"
+	"crypto/rand"
 )
 
 func NewProxiedTransport(proxy *url.URL) http.RoundTripper {
@@ -55,7 +55,7 @@ type transport struct {
 		opaque    string
 		algorithm string
 		qop       string
-		nc        int
+		nc        uint32
 	}
 }
 
@@ -189,7 +189,7 @@ func (tr *transport) authorize(req *http.Request, authenticate string) (string, 
 				getMD5(ha1, tr.auth.nonce, ha2))
 		} else {
 			tr.auth.nc += 1
-			cnonce := uniuri.New()
+			cnonce := getNonce()
 			nc := fmt.Sprintf("%08x", tr.auth.nc)
 
 			response = fmt.Sprintf(
@@ -309,6 +309,15 @@ func parseList(s string) []string {
 func getMD5(data ...string) string {
 	h := md5.Sum([]byte(strings.Join(data, ":")))
 	return hex.EncodeToString(h[:])
+}
+
+func getNonce() string {
+	var buf [15]byte
+	_, err := rand.Read(buf[:])
+	if err != nil {
+		panic("error reading random bytes: " + err.Error())
+	}
+	return base64.RawURLEncoding.EncodeToString(buf[:])
 }
 
 func getStatusError(status string) error {
