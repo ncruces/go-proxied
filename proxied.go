@@ -18,6 +18,11 @@ import (
 	"crypto/rand"
 )
 
+// NewProxiedTransport returns a http.RoundTripper that wraps http.DefaultTransport
+// using the provided proxy for all requests.
+//
+// It supports Digest authentication for proxies, in addition to all proxies
+// supported by http.DefaultTransport.
 func NewProxiedTransport(proxy *url.URL) http.RoundTripper {
 	if proxy == nil || proxy.User == nil || (proxy.Scheme != "http" && proxy.Scheme != "https") {
 		clone := http.DefaultTransport.(*http.Transport).Clone()
