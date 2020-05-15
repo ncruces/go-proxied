@@ -89,10 +89,14 @@ func (tr *transport) wrapDialContext() {
 			Header: make(http.Header),
 		}
 
-		_, err = tr.doRoundTrip(req, &connectRoundTripper{ctx, conn})
+		res, err := tr.doRoundTrip(req, &connectRoundTripper{ctx, conn})
 		if err != nil {
 			conn.Close()
 			return nil, err
+		}
+		if res.StatusCode != http.StatusOK {
+			conn.Close()
+			return nil, errors.New(http.StatusText(res.StatusCode))
 		}
 		return conn, nil
 	}
@@ -254,16 +258,8 @@ func (rt *connectRoundTripper) RoundTrip(req *http.Request) (res *http.Response,
 		return nil, ctx.Err()
 	case <-readDone:
 		// res or err now set
+		return res, err
 	}
-	if err != nil {
-		rt.conn.Close()
-		return nil, err
-	}
-	if res.StatusCode != http.StatusOK {
-		rt.conn.Close()
-		return nil, getStatusError(res.Status)
-	}
-	return res, nil
 }
 
 // adapted from: https://pkg.go.dev/github.com/golang/gddo/httputil/header#ParseList
@@ -323,12 +319,4 @@ func getNonce() string {
 		panic("error reading random bytes: " + err.Error())
 	}
 	return base64.RawURLEncoding.EncodeToString(buf[:])
-}
-
-func getStatusError(status string) error {
-	f := strings.SplitN(status, " ", 2)
-	if len(f) < 2 {
-		return errors.New("unknown status code")
-	}
-	return errors.New(f[1])
 }
