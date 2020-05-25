@@ -111,8 +111,7 @@ func (tr *transport) doRoundTrip(req *http.Request, rt http.RoundTripper) (*http
 
 	res, err := rt.RoundTrip(req)
 	if res != nil && res.StatusCode == http.StatusProxyAuthRequired {
-		err = res.Body.Close()
-		if err != nil {
+		if err := res.Body.Close(); err != nil {
 			return nil, err
 		}
 
@@ -120,7 +119,7 @@ func (tr *transport) doRoundTrip(req *http.Request, rt http.RoundTripper) (*http
 			return nil, err
 		} else if auth != "" && auth != req.Header.Get("Proxy-Authorization") {
 			req.Header.Set("Proxy-Authorization", auth)
-			res, err = rt.RoundTrip(req)
+			return rt.RoundTrip(req)
 		}
 	}
 	return res, err
