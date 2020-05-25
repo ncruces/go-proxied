@@ -25,26 +25,48 @@ import (
 // supported by http.DefaultTransport.
 func NewProxiedTransport(proxy *url.URL) http.RoundTripper {
 	if proxy == nil || proxy.User == nil || (proxy.Scheme != "http" && proxy.Scheme != "https") {
-		clone := http.DefaultTransport.(*http.Transport).Clone()
-		clone.Proxy = http.ProxyURL(proxy)
-		return clone
+		return baseTransport(proxy)
 	}
-
-	var tr transport
 
 	noAuth := *proxy
 	noAuth.User = nil
 
+	var tr transport
 	tr.proxy = proxy
-
-	tr.transport = http.DefaultTransport.(*http.Transport).Clone()
-	tr.transport.Proxy = http.ProxyURL(&noAuth)
-
-	tr.tlsTransport = http.DefaultTransport.(*http.Transport).Clone()
-	tr.tlsTransport.Proxy = nil
+	tr.transport = baseTransport(&noAuth)
+	tr.tlsTransport = baseTransport(nil)
 	tr.wrapDialContext()
 
 	return &tr
+}
+
+func baseTransport(proxy *url.URL) *http.Transport {
+	var proxyFunc func(*http.Request) (*url.URL, error)
+	if proxy != nil {
+		proxyFunc = http.ProxyURL(proxy)
+	}
+
+	if tr, ok := http.DefaultTransport.(*http.Transport); ok {
+		tr = tr.Clone()
+		tr.Proxy = proxyFunc
+		if tr.MaxIdleConnsPerHost < http.DefaultMaxIdleConnsPerHost {
+			tr.MaxIdleConnsPerHost = http.DefaultMaxIdleConnsPerHost
+		}
+		return tr
+	}
+
+	return &http.Transport{
+		DialContext: (&net.Dialer{
+			Timeout:   30 * time.Second,
+			KeepAlive: 30 * time.Second,
+			DualStack: true,
+		}).DialContext,
+		ForceAttemptHTTP2:     true,
+		MaxIdleConns:          100,
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+	}
 }
 
 type transport struct {
