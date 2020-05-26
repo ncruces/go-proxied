@@ -49,13 +49,11 @@ func baseTransport(proxy *url.URL) *http.Transport {
 	if tr, ok := http.DefaultTransport.(*http.Transport); ok {
 		tr = tr.Clone()
 		tr.Proxy = proxyFunc
-		if tr.MaxIdleConnsPerHost < http.DefaultMaxIdleConnsPerHost {
-			tr.MaxIdleConnsPerHost = http.DefaultMaxIdleConnsPerHost
-		}
 		return tr
 	}
 
 	return &http.Transport{
+		Proxy: proxyFunc,
 		DialContext: (&net.Dialer{
 			Timeout:   30 * time.Second,
 			KeepAlive: 30 * time.Second,
