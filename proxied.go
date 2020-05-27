@@ -1,3 +1,5 @@
+// Package proxied implements a proxied http.Transport
+// supporting digest access authentication.
 package proxied
 
 import (
