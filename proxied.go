@@ -6,6 +6,7 @@ import (
 	"bufio"
 	"context"
 	"crypto/md5"
+	"crypto/tls"
 	"encoding/base64"
 	"encoding/hex"
 	"errors"
@@ -20,42 +21,74 @@ import (
 	"crypto/rand"
 )
 
-// NewProxiedTransport returns a http.RoundTripper that wraps http.DefaultTransport
-// using the provided proxy for all requests.
+// NewProxiedTransport returns a http.RoundTripper that wraps a http.Transport
+// and uses proxy for all requests.
 //
-// It supports Digest authentication for proxies, in addition to all proxies
-// supported by http.DefaultTransport.
+// It supports digest access authentication for proxies,
+// in addition to all schemes supported by http.Transport.
 func NewProxiedTransport(proxy *url.URL) http.RoundTripper {
 	if proxy == nil || proxy.User == nil || (proxy.Scheme != "http" && proxy.Scheme != "https") {
-		return baseTransport(proxy)
-	}
-
-	noAuth := *proxy
-	noAuth.User = nil
-
-	var tr transport
-	tr.proxy = proxy
-	tr.transport = baseTransport(&noAuth)
-	tr.tlsTransport = baseTransport(nil)
-	tr.wrapDialContext()
-
-	return &tr
-}
-
-func baseTransport(proxy *url.URL) *http.Transport {
-	var proxyFunc func(*http.Request) (*url.URL, error)
-	if proxy != nil {
-		proxyFunc = http.ProxyURL(proxy)
-	}
-
-	if tr, ok := http.DefaultTransport.(*http.Transport); ok {
-		tr = tr.Clone()
-		tr.Proxy = proxyFunc
+		tr := newTransport()
+		tr.Proxy = http.ProxyURL(proxy)
 		return tr
 	}
 
+	tr := transport{
+		Transport: *newTransport(),
+		proxy:     proxy,
+	}
+	dial := tr.DialContext
+	tr.Proxy = func(req *http.Request) (*url.URL, error) {
+		if req.URL.Scheme == "http" {
+			// let Go connect to the proxy,
+			// but negotiate any authentication ourselves
+			noAuth := *proxy
+			noAuth.User = nil
+			return &noAuth, nil
+		}
+		// connect to the proxy ourselves
+		return nil, nil
+	}
+	tr.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+		conn, err := dial(ctx, network, tr.proxyAddr())
+		if err != nil {
+			return nil, err
+		}
+
+		if tr.proxy.Scheme == "https" {
+			conn = tls.Client(conn, tr.tlsConfig(tr.proxy.Hostname()))
+		}
+
+		if addr != tr.proxyAddr() {
+			req := &http.Request{
+				Method: http.MethodConnect,
+				URL:    &url.URL{Opaque: addr},
+				Host:   addr,
+				Header: make(http.Header),
+			}
+
+			res, err := tr.doRoundTrip(req, &connectRoundTripper{ctx, conn})
+			if err != nil {
+				conn.Close()
+				return nil, err
+			}
+			if res.StatusCode != http.StatusOK {
+				conn.Close()
+				return nil, errors.New(http.StatusText(res.StatusCode))
+			}
+		}
+
+		return conn, nil
+	}
+	return &tr
+}
+
+func newTransport() *http.Transport {
+	if tr, ok := http.DefaultTransport.(*http.Transport); ok {
+		return tr.Clone()
+	}
+
 	return &http.Transport{
-		Proxy: proxyFunc,
 		DialContext: (&net.Dialer{
 			Timeout:   30 * time.Second,
 			KeepAlive: 30 * time.Second,
@@ -70,11 +103,9 @@ func baseTransport(proxy *url.URL) *http.Transport {
 }
 
 type transport struct {
-	proxy        *url.URL
-	transport    *http.Transport
-	tlsTransport *http.Transport
-
-	auth struct {
+	http.Transport
+	proxy *url.URL
+	auth  struct {
 		mx        sync.Mutex
 		typ       string
 		realm     string
@@ -87,41 +118,7 @@ type transport struct {
 }
 
 func (tr *transport) RoundTrip(req *http.Request) (*http.Response, error) {
-	if req.URL.Scheme == "https" {
-		return tr.tlsTransport.RoundTrip(req)
-	}
-	return tr.doRoundTrip(req, tr.transport)
-}
-
-func (tr *transport) wrapDialContext() {
-	// store the default DialContext
-	dialContext := tr.tlsTransport.DialContext
-
-	// and wrap it
-	tr.tlsTransport.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
-		conn, err := dialContext(ctx, network, tr.proxy.Host)
-		if err != nil {
-			return nil, err
-		}
-
-		req := &http.Request{
-			Method: http.MethodConnect,
-			URL:    &url.URL{Opaque: addr},
-			Host:   addr,
-			Header: make(http.Header),
-		}
-
-		res, err := tr.doRoundTrip(req, &connectRoundTripper{ctx, conn})
-		if err != nil {
-			conn.Close()
-			return nil, err
-		}
-		if res.StatusCode != http.StatusOK {
-			conn.Close()
-			return nil, errors.New(http.StatusText(res.StatusCode))
-		}
-		return conn, nil
-	}
+	return tr.doRoundTrip(req, &tr.Transport)
 }
 
 func (tr *transport) doRoundTrip(req *http.Request, rt http.RoundTripper) (*http.Response, error) {
@@ -145,6 +142,24 @@ func (tr *transport) doRoundTrip(req *http.Request, rt http.RoundTripper) (*http
 		}
 	}
 	return res, err
+}
+
+func (tr *transport) proxyAddr() string {
+	if _, _, err := net.SplitHostPort(tr.proxy.Host); err == nil {
+		return tr.proxy.Host
+	}
+	return tr.proxy.Host + ":" + tr.proxy.Scheme
+}
+
+func (tr *transport) tlsConfig(serverName string) *tls.Config {
+	cfg := tr.TLSClientConfig
+	if cfg == nil {
+		cfg = &tls.Config{}
+	} else if cfg.ServerName != serverName {
+		cfg = cfg.Clone()
+	}
+	cfg.ServerName = serverName
+	return cfg
 }
 
 func (tr *transport) authorize(req *http.Request, authenticate string) (string, error) {
