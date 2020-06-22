@@ -185,8 +185,7 @@ func (tr *transport) authorize(req *http.Request, authenticate string) (string, 
 					continue
 				}
 
-				s[1] = strings.TrimPrefix(s[1], `"`)
-				s[1] = strings.TrimSuffix(s[1], `"`)
+				s[1] = unquote(s[1])
 
 				switch s[0] {
 				case "realm":
@@ -229,8 +228,8 @@ func (tr *transport) authorize(req *http.Request, authenticate string) (string, 
 
 		if tr.auth.qop == "" {
 			response = fmt.Sprintf(
-				`Digest username="%s", realm="%s", nonce="%s", uri="%s", response="%s"`,
-				username, tr.auth.realm, tr.auth.nonce, req.URL, // escape these
+				`Digest username=%s, realm=%s, nonce=%s, uri=%s, response="%s"`,
+				quote(username), quote(tr.auth.realm), quote(tr.auth.nonce), quote(req.URL.String()),
 				getMD5(ha1, tr.auth.nonce, ha2))
 		} else {
 			tr.auth.nc += 1
@@ -238,17 +237,17 @@ func (tr *transport) authorize(req *http.Request, authenticate string) (string, 
 			nc := fmt.Sprintf("%08x", tr.auth.nc)
 
 			response = fmt.Sprintf(
-				`Digest username="%s", realm="%s", nonce="%s", uri="%s", response="%s", nc=%s, cnonce="%s", qop=%s`,
-				username, tr.auth.realm, tr.auth.nonce, req.URL, // escape these
+				`Digest username=%s, realm=%s, nonce=%s, uri=%s, response="%s", nc=%s, cnonce="%s", qop=%s`,
+				quote(username), quote(tr.auth.realm), quote(tr.auth.nonce), quote(req.URL.String()),
 				getMD5(ha1, tr.auth.nonce, nc, cnonce, tr.auth.qop, ha2),
 				nc, cnonce, tr.auth.qop)
 		}
 
 		if tr.auth.algorithm != "" {
-			response = response + `, algorithm=` + tr.auth.algorithm
+			response = response + ", algorithm=" + tr.auth.algorithm
 		}
 		if tr.auth.opaque != "" {
-			response = response + `, opaque="` + tr.auth.opaque + `"` // escape
+			response = response + ", opaque=" + quote(tr.auth.opaque)
 		}
 	}
 
@@ -341,6 +340,56 @@ func parseList(s string) []string {
 		result = append(result, s[begin:end])
 	}
 	return result
+}
+
+func quote(s string) string {
+	var result strings.Builder
+	result.Grow(len(s) + 2)
+	result.WriteByte('"')
+
+	for i := 0; i < len(s); i++ {
+		b := s[i]
+		if b == '\\' || b == '"' {
+			result.WriteByte('\\')
+		}
+		result.WriteByte(b)
+	}
+
+	result.WriteByte('"')
+	return result.String()
+}
+
+func unquote(s string) string {
+	if len(s) <= 2 || s[0] != '"' || s[len(s)-1] != '"' {
+		return s
+	}
+
+	if strings.IndexAny(s[1:len(s)-1], `\"`) < 0 {
+		return s[1 : len(s)-1]
+	}
+
+	var result strings.Builder
+	result.Grow(len(s) - 2)
+	escape := false
+
+	for i := 1; i < len(s)-1; i++ {
+		b := s[i]
+		switch {
+		case escape:
+			escape = false
+		case b == '\\':
+			escape = true
+			continue
+		case b == '"':
+			return s
+		}
+		result.WriteByte(b)
+	}
+
+	if escape {
+		return s
+	}
+	return result.String()
 }
 
 func getMD5(data ...string) string {

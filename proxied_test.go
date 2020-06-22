@@ -61,3 +61,45 @@ func TestProxiedTransport(t *testing.T) {
 		})
 	}
 }
+
+func Test_quote(t *testing.T) {
+	tests := map[string]struct {
+		s    string
+		want string
+	}{
+		"simple":  {s: `abc`, want: `"abc"`},
+		"quotes":  {s: `"abc"`, want: `"\"abc\""`},
+		"escapes": {s: `\abc\`, want: `"\\abc\\"`},
+	}
+
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			if got := quote(tt.s); got != tt.want {
+				t.Errorf("quote(%v) = %v, want %v", tt.s, got, tt.want)
+			} else if got := unquote(got); got != tt.s {
+				t.Errorf("unquote(quote(%v) = %v, want %v", tt.s, got, tt.s)
+			}
+		})
+	}
+}
+
+func Test_unquote(t *testing.T) {
+	tests := map[string]struct {
+		s    string
+		want string
+	}{
+		"simple":       {s: `abc`, want: `abc`},
+		"quoted":       {s: `"abc"`, want: `abc`},
+		"escaped":      {s: `"\"abc\""`, want: `"abc"`},
+		"stray quote":  {s: `"abc""`, want: `"abc""`},
+		"stray escape": {s: `"abc\"`, want: `"abc\"`},
+	}
+
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			if got := unquote(tt.s); got != tt.want {
+				t.Errorf("unquote(%v) = %v, want %v", tt.s, got, tt.want)
+			}
+		})
+	}
+}
