@@ -39,15 +39,15 @@ func NewProxiedTransport(proxy *url.URL) http.RoundTripper {
 	}
 	dial := tr.DialContext
 	tr.Proxy = func(req *http.Request) (*url.URL, error) {
-		if req.URL.Scheme == "http" {
-			// let Go connect to the proxy,
-			// but negotiate any authentication ourselves
-			noAuth := *proxy
-			noAuth.User = nil
-			return &noAuth, nil
+		if req.URL.Scheme == "https" {
+			// connect to the proxy ourselves
+			return nil, nil
 		}
-		// connect to the proxy ourselves
-		return nil, nil
+		// let transport connect to the proxy,
+		// but negotiate authentication ourselves
+		noAuth := *proxy
+		noAuth.User = nil
+		return &noAuth, nil
 	}
 	tr.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
 		conn, err := dial(ctx, network, tr.proxyAddr())
@@ -118,7 +118,11 @@ type transport struct {
 }
 
 func (tr *transport) RoundTrip(req *http.Request) (*http.Response, error) {
-	return tr.doRoundTrip(req, &tr.Transport)
+	if req.URL.Scheme == "https" {
+		return tr.Transport.RoundTrip(req)
+	} else {
+		return tr.doRoundTrip(req, &tr.Transport)
+	}
 }
 
 func (tr *transport) doRoundTrip(req *http.Request, rt http.RoundTripper) (*http.Response, error) {
@@ -163,10 +167,6 @@ func (tr *transport) tlsConfig(serverName string) *tls.Config {
 }
 
 func (tr *transport) authorize(req *http.Request, authenticate string) (string, error) {
-	// if tr.proxy == nil || tr.proxy.User == nil {
-	// 	return ""
-	// }
-
 	username := tr.proxy.User.Username()
 	password, _ := tr.proxy.User.Password()
 
@@ -185,25 +185,25 @@ func (tr *transport) authorize(req *http.Request, authenticate string) (string, 
 					continue
 				}
 
-				s[1] = unquote(s[1])
+				unq := unquote(s[1])
 
 				switch s[0] {
+				case "algorithm":
+					tr.auth.algorithm = unq
+				case "qop":
+					tr.auth.qop = unq
 				case "realm":
-					tr.auth.realm = s[1]
+					tr.auth.realm = unq
 				case "nonce":
-					tr.auth.nonce = s[1]
+					tr.auth.nonce = unq
 				case "opaque":
 					tr.auth.opaque = s[1]
-				case "algorithm":
-					tr.auth.algorithm = s[1]
-				case "qop":
-					tr.auth.qop = s[1]
 				}
 			}
 		}
 	}
 
-	// we don't have a saved authentication type, but are secure, so try Basic
+	// don't know the authentication type, but the proxy is secure, try Basic
 	if tr.auth.typ == "" && tr.proxy.Scheme == "https" {
 		tr.auth.typ = "Basic"
 	}
@@ -223,13 +223,14 @@ func (tr *transport) authorize(req *http.Request, authenticate string) (string, 
 			return "", errors.New("Digest authentication: unsupported quality of protection")
 		}
 
-		ha1 := getMD5(username, tr.auth.realm, password) // OK
-		ha2 := getMD5(req.Method, req.URL.String())      // OK
+		url := req.URL.String()
+		ha1 := getMD5(username, tr.auth.realm, password)
+		ha2 := getMD5(req.Method, url)
 
 		if tr.auth.qop == "" {
 			response = fmt.Sprintf(
 				`Digest username=%s, realm=%s, nonce=%s, uri=%s, response="%s"`,
-				quote(username), quote(tr.auth.realm), quote(tr.auth.nonce), quote(req.URL.String()),
+				quote(username), quote(tr.auth.realm), quote(tr.auth.nonce), quote(url),
 				getMD5(ha1, tr.auth.nonce, ha2))
 		} else {
 			tr.auth.nc += 1
@@ -238,16 +239,16 @@ func (tr *transport) authorize(req *http.Request, authenticate string) (string, 
 
 			response = fmt.Sprintf(
 				`Digest username=%s, realm=%s, nonce=%s, uri=%s, response="%s", nc=%s, cnonce="%s", qop=%s`,
-				quote(username), quote(tr.auth.realm), quote(tr.auth.nonce), quote(req.URL.String()),
+				quote(username), quote(tr.auth.realm), quote(tr.auth.nonce), quote(url),
 				getMD5(ha1, tr.auth.nonce, nc, cnonce, tr.auth.qop, ha2),
 				nc, cnonce, tr.auth.qop)
 		}
 
 		if tr.auth.algorithm != "" {
-			response = response + ", algorithm=" + tr.auth.algorithm
+			response += ", algorithm=" + tr.auth.algorithm
 		}
 		if tr.auth.opaque != "" {
-			response = response + ", opaque=" + quote(tr.auth.opaque)
+			response += ", opaque=" + tr.auth.opaque
 		}
 	}
 
