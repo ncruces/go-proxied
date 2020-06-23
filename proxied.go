@@ -203,6 +203,11 @@ func (tr *transport) authorize(req *http.Request, authenticate string) (string, 
 		}
 	}
 
+	// refuse to do Basic authentication over http
+	if tr.auth.typ == "Basic" && tr.proxy.Scheme == "http" {
+		return "", errors.New("Basic authentication: unsupported protocol")
+	}
+
 	// don't know the authentication type, but the proxy is secure, try Basic
 	if tr.auth.typ == "" && tr.proxy.Scheme == "https" {
 		tr.auth.typ = "Basic"
